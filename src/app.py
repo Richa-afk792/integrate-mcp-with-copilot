@@ -13,6 +13,7 @@ import json
 import uuid
 import hmac
 import hashlib
+import binascii
 import time
 from pathlib import Path
 from pydantic import BaseModel
@@ -32,6 +33,30 @@ app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
 ADMIN_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_TOKEN_TTL_SECONDS", "3600"))
+ALLOW_PLAINTEXT_CREDENTIALS = (
+    os.getenv("ALLOW_PLAINTEXT_CREDENTIALS", "false").lower() == "true"
+)
+
+
+def parse_teacher_credentials_payload(payload: object, source: str) -> dict[str, str]:
+    """Validate credentials payload shape and return a normalized mapping."""
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid {source}: expected top-level JSON object")
+
+    teachers = payload.get("teachers", {})
+    if not isinstance(teachers, dict):
+        raise RuntimeError(f"Invalid {source}: 'teachers' must be a JSON object")
+
+    invalid_entries = [
+        key for key, value in teachers.items()
+        if not isinstance(key, str) or not isinstance(value, str)
+    ]
+    if invalid_entries:
+        raise RuntimeError(
+            f"Invalid {source}: teacher usernames/passwords must be strings"
+        )
+
+    return teachers
 
 
 def load_teacher_credentials() -> dict[str, str]:
@@ -46,7 +71,7 @@ def load_teacher_credentials() -> dict[str, str]:
                 "Invalid TEACHER_CREDENTIALS_JSON value: expected valid JSON"
             ) from exc
 
-        return payload.get("teachers", {})
+        return parse_teacher_credentials_payload(payload, "TEACHER_CREDENTIALS_JSON")
 
     teachers_file = current_dir / "teachers.json"
 
@@ -61,15 +86,43 @@ def load_teacher_credentials() -> dict[str, str]:
             f"Failed to load teacher credentials from {teachers_file}"
         ) from exc
 
-    return payload.get("teachers", {})
+    return parse_teacher_credentials_payload(payload, str(teachers_file))
+
+
+def verify_pbkdf2_sha256_password(stored_password: str, provided_password: str) -> bool:
+    parts = stored_password.split("$", 3)
+    if len(parts) != 4:
+        return False
+
+    _, iterations_text, salt_hex, expected_hash_hex = parts
+    try:
+        iterations = int(iterations_text)
+        salt = bytes.fromhex(salt_hex)
+        expected_hash = bytes.fromhex(expected_hash_hex)
+    except (ValueError, binascii.Error):
+        return False
+
+    actual_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        provided_password.encode("utf-8"),
+        salt,
+        iterations
+    )
+    return hmac.compare_digest(expected_hash, actual_hash)
 
 
 def verify_password(stored_password: str, provided_password: str) -> bool:
-    """Support either plaintext (demo) or sha256$<hex> credential format."""
+    """Verify password against pbkdf2/sha256 formats, optionally plaintext for demos."""
+    if stored_password.startswith("pbkdf2_sha256$"):
+        return verify_pbkdf2_sha256_password(stored_password, provided_password)
+
     if stored_password.startswith("sha256$"):
         expected_hash = stored_password.split("$", 1)[1]
         actual_hash = hashlib.sha256(provided_password.encode("utf-8")).hexdigest()
         return hmac.compare_digest(expected_hash, actual_hash)
+
+    if not ALLOW_PLAINTEXT_CREDENTIALS:
+        return False
 
     return hmac.compare_digest(stored_password, provided_password)
 
@@ -181,14 +234,21 @@ def admin_login(request: AdminLoginRequest):
 def verify_admin_token(token: str | None):
     cleanup_expired_tokens()
 
-    if token is None or token not in active_admin_tokens:
+    if token is None:
         raise HTTPException(
             status_code=403,
             detail="Admin privileges required"
         )
 
-    if active_admin_tokens[token] <= time.time():
-        del active_admin_tokens[token]
+    expires_at = active_admin_tokens.get(token)
+    if expires_at is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin privileges required"
+        )
+
+    if expires_at <= time.time():
+        active_admin_tokens.pop(token, None)
         raise HTTPException(
             status_code=403,
             detail="Admin token expired"

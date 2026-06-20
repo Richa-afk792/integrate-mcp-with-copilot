@@ -8,10 +8,12 @@ document.addEventListener("DOMContentLoaded", () => {
   const closeModalBtn = document.getElementById("close-modal-btn");
   const adminLoginForm = document.getElementById("admin-login-form");
   const adminStatus = document.getElementById("admin-status");
+  const adminUsernameInput = document.getElementById("admin-username");
 
   let adminToken = null;
   let adminUsername = null;
   let messageTimeoutId = null;
+  let lastFocusedElement = null;
 
   function showMessage(text, type) {
     messageDiv.textContent = text;
@@ -41,12 +43,27 @@ document.addEventListener("DOMContentLoaded", () => {
       adminStatus.textContent = `Logged in as ${adminUsername}. You can register and unregister students.`;
       adminStatus.className = "message success";
       userMenuBtn.textContent = "✅";
+      userMenuBtn.setAttribute("aria-label", "Admin logged in");
       userMenuBtn.title = "Teacher logged in";
     } else {
       adminStatus.textContent = "Students can view activity rosters. Teachers must log in to register or unregister students.";
       adminStatus.className = "message info";
       userMenuBtn.textContent = "👤";
+      userMenuBtn.setAttribute("aria-label", "Open admin login");
       userMenuBtn.title = "Open teacher login";
+    }
+  }
+
+  function openAdminModal() {
+    lastFocusedElement = document.activeElement;
+    adminModal.classList.remove("hidden");
+    adminUsernameInput.focus();
+  }
+
+  function closeAdminModal() {
+    adminModal.classList.add("hidden");
+    if (lastFocusedElement instanceof HTMLElement) {
+      lastFocusedElement.focus();
     }
   }
 
@@ -82,7 +99,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     (email) =>
                       `<li><span class="participant-email">${email}</span>${
                         isAdmin
-                          ? `<button class="delete-btn" data-activity="${name}" data-email="${email}">❌</button>`
+                          ? `<button class="delete-btn" type="button" aria-label="Unregister ${email} from ${name}" data-activity="${name}" data-email="${email}">❌</button>`
                           : ""
                       }</li>`
                   )
@@ -198,12 +215,48 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  userMenuBtn.addEventListener("click", () => {
-    adminModal.classList.remove("hidden");
+  userMenuBtn.addEventListener("click", openAdminModal);
+
+  closeModalBtn.addEventListener("click", closeAdminModal);
+
+  adminModal.addEventListener("click", (event) => {
+    if (event.target === adminModal) {
+      closeAdminModal();
+    }
   });
 
-  closeModalBtn.addEventListener("click", () => {
-    adminModal.classList.add("hidden");
+  document.addEventListener("keydown", (event) => {
+    if (adminModal.classList.contains("hidden")) {
+      return;
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeAdminModal();
+      return;
+    }
+
+    if (event.key !== "Tab") {
+      return;
+    }
+
+    const focusableElements = adminModal.querySelectorAll(
+      "button, input, select, textarea, [href], [tabindex]:not([tabindex='-1'])"
+    );
+    if (focusableElements.length === 0) {
+      return;
+    }
+
+    const firstElement = focusableElements[0];
+    const lastElement = focusableElements[focusableElements.length - 1];
+
+    if (event.shiftKey && document.activeElement === firstElement) {
+      event.preventDefault();
+      lastElement.focus();
+    } else if (!event.shiftKey && document.activeElement === lastElement) {
+      event.preventDefault();
+      firstElement.focus();
+    }
   });
 
   adminLoginForm.addEventListener("submit", async (event) => {
@@ -231,7 +284,7 @@ document.addEventListener("DOMContentLoaded", () => {
       adminToken = result.token;
       adminUsername = result.username;
       adminLoginForm.reset();
-      adminModal.classList.add("hidden");
+      closeAdminModal();
       updateAdminUI();
       fetchActivities();
       showMessage(`Welcome ${adminUsername}. Admin mode enabled.`, "success");
