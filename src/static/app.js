@@ -43,7 +43,7 @@ document.addEventListener("DOMContentLoaded", () => {
       adminStatus.textContent = `Logged in as ${adminUsername}. You can register and unregister students.`;
       adminStatus.className = "message success";
       userMenuBtn.textContent = "✅";
-      userMenuBtn.setAttribute("aria-label", "Admin logged in");
+      userMenuBtn.setAttribute("aria-label", "Open teacher menu");
       userMenuBtn.title = "Teacher logged in";
     } else {
       adminStatus.textContent = "Students can view activity rosters. Teachers must log in to register or unregister students.";
