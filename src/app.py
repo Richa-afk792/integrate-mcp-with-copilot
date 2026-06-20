@@ -9,15 +9,137 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
+import json
+import uuid
+import hmac
+import hashlib
+import binascii
+import time
 from pathlib import Path
+from pydantic import BaseModel
+from fastapi import Header
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+ADMIN_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_TOKEN_TTL_SECONDS", "3600"))
+ALLOW_PLAINTEXT_CREDENTIALS = (
+    os.getenv("ALLOW_PLAINTEXT_CREDENTIALS", "false").lower() == "true"
+)
+
+
+def parse_teacher_credentials_payload(payload: object, source: str) -> dict[str, str]:
+    """Validate credentials payload shape and return a normalized mapping."""
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid {source}: expected top-level JSON object")
+
+    teachers = payload.get("teachers", {})
+    if not isinstance(teachers, dict):
+        raise RuntimeError(f"Invalid {source}: 'teachers' must be a JSON object")
+
+    invalid_entries = [
+        key for key, value in teachers.items()
+        if not isinstance(key, str) or not isinstance(value, str)
+    ]
+    if invalid_entries:
+        raise RuntimeError(
+            f"Invalid {source}: teacher usernames/passwords must be strings"
+        )
+
+    return teachers
+
+
+def load_teacher_credentials() -> dict[str, str]:
+    """Load teacher credentials from env JSON or a local JSON file."""
+    env_json = os.getenv("TEACHER_CREDENTIALS_JSON")
+
+    if env_json:
+        try:
+            payload = json.loads(env_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "Invalid TEACHER_CREDENTIALS_JSON value: expected valid JSON"
+            ) from exc
+
+        return parse_teacher_credentials_payload(payload, "TEACHER_CREDENTIALS_JSON")
+
+    teachers_file = current_dir / "teachers.json"
+
+    if not teachers_file.exists():
+        return {}
+
+    try:
+        with open(teachers_file, "r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Failed to load teacher credentials from {teachers_file}"
+        ) from exc
+
+    return parse_teacher_credentials_payload(payload, str(teachers_file))
+
+
+def verify_pbkdf2_sha256_password(stored_password: str, provided_password: str) -> bool:
+    parts = stored_password.split("$", 3)
+    if len(parts) != 4:
+        return False
+
+    _, iterations_text, salt_hex, expected_hash_hex = parts
+    try:
+        iterations = int(iterations_text)
+        salt = bytes.fromhex(salt_hex)
+        expected_hash = bytes.fromhex(expected_hash_hex)
+    except (ValueError, binascii.Error):
+        return False
+
+    actual_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        provided_password.encode("utf-8"),
+        salt,
+        iterations
+    )
+    return hmac.compare_digest(expected_hash, actual_hash)
+
+
+def verify_password(stored_password: str, provided_password: str) -> bool:
+    """Verify password against pbkdf2/sha256 formats, optionally plaintext for demos."""
+    if stored_password.startswith("pbkdf2_sha256$"):
+        return verify_pbkdf2_sha256_password(stored_password, provided_password)
+
+    if stored_password.startswith("sha256$"):
+        expected_hash = stored_password.split("$", 1)[1]
+        actual_hash = hashlib.sha256(provided_password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(expected_hash, actual_hash)
+
+    if not ALLOW_PLAINTEXT_CREDENTIALS:
+        return False
+
+    return hmac.compare_digest(stored_password, provided_password)
+
+
+def cleanup_expired_tokens() -> None:
+    now = time.time()
+    expired_tokens = [
+        token for token, expires_at in active_admin_tokens.items()
+        if expires_at <= now
+    ]
+
+    for token in expired_tokens:
+        del active_admin_tokens[token]
+
+
+teacher_credentials = load_teacher_credentials()
+active_admin_tokens: dict[str, float] = {}
 
 # In-memory activity database
 activities = {
@@ -88,9 +210,60 @@ def get_activities():
     return activities
 
 
+@app.post("/admin/login")
+def admin_login(request: AdminLoginRequest):
+    """Authenticate a teacher and return a temporary admin token."""
+    cleanup_expired_tokens()
+    valid_password = teacher_credentials.get(request.username)
+
+    if valid_password is None or not verify_password(valid_password, request.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = str(uuid.uuid4())
+    expires_at = time.time() + ADMIN_TOKEN_TTL_SECONDS
+    active_admin_tokens[token] = expires_at
+
+    return {
+        "message": "Login successful",
+        "token": token,
+        "username": request.username,
+        "expires_in_seconds": ADMIN_TOKEN_TTL_SECONDS
+    }
+
+
+def verify_admin_token(token: str | None):
+    cleanup_expired_tokens()
+
+    if token is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin privileges required"
+        )
+
+    expires_at = active_admin_tokens.get(token)
+    if expires_at is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin privileges required"
+        )
+
+    if expires_at <= time.time():
+        active_admin_tokens.pop(token, None)
+        raise HTTPException(
+            status_code=403,
+            detail="Admin token expired"
+        )
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")
+):
     """Sign up a student for an activity"""
+    verify_admin_token(x_admin_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +284,14 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")
+):
     """Unregister a student from an activity"""
+    verify_admin_token(x_admin_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
