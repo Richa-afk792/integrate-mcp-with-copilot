@@ -11,14 +11,20 @@ document.addEventListener("DOMContentLoaded", () => {
 
   let adminToken = null;
   let adminUsername = null;
+  let messageTimeoutId = null;
 
   function showMessage(text, type) {
     messageDiv.textContent = text;
-    messageDiv.className = type;
+    messageDiv.className = `message ${type}`;
     messageDiv.classList.remove("hidden");
 
-    setTimeout(() => {
+    if (messageTimeoutId !== null) {
+      clearTimeout(messageTimeoutId);
+    }
+
+    messageTimeoutId = setTimeout(() => {
       messageDiv.classList.add("hidden");
+      messageTimeoutId = null;
     }, 5000);
   }
 
@@ -33,12 +39,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
     if (isAdmin) {
       adminStatus.textContent = `Logged in as ${adminUsername}. You can register and unregister students.`;
-      adminStatus.className = "success";
+      adminStatus.className = "message success";
       userMenuBtn.textContent = "✅";
       userMenuBtn.title = "Teacher logged in";
     } else {
       adminStatus.textContent = "Students can view activity rosters. Teachers must log in to register or unregister students.";
-      adminStatus.className = "info";
+      adminStatus.className = "message info";
       userMenuBtn.textContent = "👤";
       userMenuBtn.title = "Open teacher login";
     }

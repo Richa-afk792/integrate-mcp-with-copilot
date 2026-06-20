@@ -11,6 +11,9 @@ from fastapi.responses import RedirectResponse
 import os
 import json
 import uuid
+import hmac
+import hashlib
+import time
 from pathlib import Path
 from pydantic import BaseModel
 from fastapi import Header
@@ -28,22 +31,62 @@ current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
+ADMIN_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_TOKEN_TTL_SECONDS", "3600"))
+
 
 def load_teacher_credentials() -> dict[str, str]:
-    """Load teacher credentials from a JSON file in the project directory."""
+    """Load teacher credentials from env JSON or a local JSON file."""
+    env_json = os.getenv("TEACHER_CREDENTIALS_JSON")
+
+    if env_json:
+        try:
+            payload = json.loads(env_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "Invalid TEACHER_CREDENTIALS_JSON value: expected valid JSON"
+            ) from exc
+
+        return payload.get("teachers", {})
+
     teachers_file = current_dir / "teachers.json"
 
     if not teachers_file.exists():
         return {}
 
-    with open(teachers_file, "r", encoding="utf-8") as fp:
-        payload = json.load(fp)
+    try:
+        with open(teachers_file, "r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Failed to load teacher credentials from {teachers_file}"
+        ) from exc
 
     return payload.get("teachers", {})
 
 
+def verify_password(stored_password: str, provided_password: str) -> bool:
+    """Support either plaintext (demo) or sha256$<hex> credential format."""
+    if stored_password.startswith("sha256$"):
+        expected_hash = stored_password.split("$", 1)[1]
+        actual_hash = hashlib.sha256(provided_password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(expected_hash, actual_hash)
+
+    return hmac.compare_digest(stored_password, provided_password)
+
+
+def cleanup_expired_tokens() -> None:
+    now = time.time()
+    expired_tokens = [
+        token for token, expires_at in active_admin_tokens.items()
+        if expires_at <= now
+    ]
+
+    for token in expired_tokens:
+        del active_admin_tokens[token]
+
+
 teacher_credentials = load_teacher_credentials()
-active_admin_tokens: dict[str, str] = {}
+active_admin_tokens: dict[str, float] = {}
 
 # In-memory activity database
 activities = {
@@ -117,26 +160,38 @@ def get_activities():
 @app.post("/admin/login")
 def admin_login(request: AdminLoginRequest):
     """Authenticate a teacher and return a temporary admin token."""
+    cleanup_expired_tokens()
     valid_password = teacher_credentials.get(request.username)
 
-    if valid_password is None or valid_password != request.password:
+    if valid_password is None or not verify_password(valid_password, request.password):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     token = str(uuid.uuid4())
-    active_admin_tokens[token] = request.username
+    expires_at = time.time() + ADMIN_TOKEN_TTL_SECONDS
+    active_admin_tokens[token] = expires_at
 
     return {
         "message": "Login successful",
         "token": token,
-        "username": request.username
+        "username": request.username,
+        "expires_in_seconds": ADMIN_TOKEN_TTL_SECONDS
     }
 
 
 def verify_admin_token(token: str | None):
+    cleanup_expired_tokens()
+
     if token is None or token not in active_admin_tokens:
         raise HTTPException(
             status_code=403,
             detail="Admin privileges required"
+        )
+
+    if active_admin_tokens[token] <= time.time():
+        del active_admin_tokens[token]
+        raise HTTPException(
+            status_code=403,
+            detail="Admin token expired"
         )
 
 
