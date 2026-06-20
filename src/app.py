@@ -9,15 +9,41 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
+import json
+import uuid
 from pathlib import Path
+from pydantic import BaseModel
+from fastapi import Header
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+def load_teacher_credentials() -> dict[str, str]:
+    """Load teacher credentials from a JSON file in the project directory."""
+    teachers_file = current_dir / "teachers.json"
+
+    if not teachers_file.exists():
+        return {}
+
+    with open(teachers_file, "r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+
+    return payload.get("teachers", {})
+
+
+teacher_credentials = load_teacher_credentials()
+active_admin_tokens: dict[str, str] = {}
 
 # In-memory activity database
 activities = {
@@ -88,9 +114,41 @@ def get_activities():
     return activities
 
 
+@app.post("/admin/login")
+def admin_login(request: AdminLoginRequest):
+    """Authenticate a teacher and return a temporary admin token."""
+    valid_password = teacher_credentials.get(request.username)
+
+    if valid_password is None or valid_password != request.password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = str(uuid.uuid4())
+    active_admin_tokens[token] = request.username
+
+    return {
+        "message": "Login successful",
+        "token": token,
+        "username": request.username
+    }
+
+
+def verify_admin_token(token: str | None):
+    if token is None or token not in active_admin_tokens:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin privileges required"
+        )
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")
+):
     """Sign up a student for an activity"""
+    verify_admin_token(x_admin_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +169,14 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")
+):
     """Unregister a student from an activity"""
+    verify_admin_token(x_admin_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
